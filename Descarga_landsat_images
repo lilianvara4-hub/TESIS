@@ -1,0 +1,115 @@
+// Script to download Landsat Images using buffer shapefile. 
+
+
+// ID_WID_MAX that you wish to download
+var riv_id = 352;
+
+// Set buffer
+var bufferID = "projects/ee-lilianvara4/assets/Buffer_names_2";
+
+// Set time window for cloud-free image composition 
+var startDate = ee.Date('2006-05-01');  //(época seca: 01/05 - 30/09)
+var endDate = ee.Date('2006-09-30');  //(época seca: 01/05 - 30/09)
+
+// Select Landsat  
+// 0 : (2013 - a más) Landsat 8
+// 1 : (1999 - 2021) Landsat 7
+// 2 : (1984 - 2012) Landsat 5
+var selector = 1;  
+var landsatSatellite = "";
+
+switch(selector){
+	case 0:
+		landsatSatellite =  'LANDSAT/LC08/C02/T1';
+		break;
+	case 1:
+		landsatSatellite =  'LANDSAT/LE07/C02/T1';
+		break;
+	case 2:
+		landsatSatellite =  'LANDSAT/LT05/C02/T1' ;
+		break;
+	default:
+		landsatSatellite =  'LANDSAT/LC08/C02/T1';
+}
+
+// Function to evaluate cloudiness 
+function maskLandsatClouds(image){
+    var qa = image.select('QA_PIXEL');
+    var cloudBitMask = ee.Number(2).pow(3).int();
+    var cirrusBitMask = ee.Number(2).pow(4).int();
+    var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+    return image.updateMask(mask);
+}
+
+// Get buffer geometry and information
+var bufferCollection = ee.FeatureCollection(bufferID);
+var bufferCollectionGeometry = bufferCollection.geometry();
+var bufferCollectionCentroid = bufferCollectionGeometry.centroid();
+
+// Load Landsat image collection 
+var landsatCollection = ee.ImageCollection(landsatSatellite).filterBounds(bufferCollectionGeometry).filterDate(startDate, endDate);
+
+// Create cloud-free image composition
+//var cloudPixelFiltered = landsatCollection.map(maskLandsatClouds).median();
+var cloudPixelFiltered = ee.Algorithms.Landsat.simpleComposite({
+         collection: landsatCollection,
+         percentile: 75,
+         cloudScoreRange: 5})
+
+// Bands of interest: Green, Red, Nir, Swir1, Swir2
+var isLandsat75 = (selector !== 0);
+var cloudPixelFiltered = cloudPixelFiltered
+.select(isLandsat75 ? ['B2','B3','B4','B5','B7'] : ['B3','B4','B5','B6','B7']);
+
+// Create rectangular shape, which represents the are of 
+// image downloaded
+var buffer = bufferCollection.filter(ee.Filter.eq("ID_WID_MAX", riv_id));
+
+//
+var cloudPixelFiltered2 = landsatCollection.map(maskLandsatClouds);
+              
+
+//NDVI
+function getNDVI(image){
+    var isLandsat75 = (selector !== 0);
+    var NDVI = image.expression('(nir - red)/(nir + red)', 
+    {'nir':image.select(isLandsat75 ? 'B4' : 'B5'), 
+    'red':image.select(isLandsat75 ? 'B3' : 'B4')}); 
+    return NDVI;
+}
+
+//NDVI visualization
+var ndviFiltered = cloudPixelFiltered2.map(getNDVI).median();
+Map.addLayer(ndviFiltered.clip(buffer), 
+            {min:0.0, max:1.0, palette:["FFFFFF", "000000"]}, 'NDVI');
+
+// Map the layers
+Map.centerObject(buffer, 11);
+//Map.addLayer(cloudPixelFiltered.clip(buffer), 
+//            {min:-1.0, max:1.0}, 'Total Buffer');
+
+// return the list of coordinates
+var listCoords = ee.Array.cat(buffer.geometry().bounds().coordinates(), 1); 
+// get the X and Y -coordinates
+var xCoords = listCoords.slice(1, 0, 1);
+var yCoords = listCoords.slice(1, 1, 2);
+// reduce the arrays to find the max (or min) value
+var xmin = xCoords.reduce('min', [0]).get([0,0]);
+var xmax = xCoords.reduce('max', [0]).get([0,0]);
+var ymin = yCoords.reduce('min', [0]).get([0,0]);
+var ymax = yCoords.reduce('max', [0]).get([0,0]);
+// Create rectangle
+var rectangle = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax],'EPSG:4326',false);
+//Map.addLayer(rectangle, {color: '#FECA1E', fillColor: '#4c4cff'}, "River Region "+(riv_id));
+
+var featureExport = cloudPixelFiltered.clip(buffer.geometry());
+
+// Export the image
+var task = Export.image.toDrive({
+  image: featureExport.toFloat(),
+  description:'ID_WID_MAX_2006_'+ riv_id,
+  region: rectangle,
+  folder: 'GEE_IMAGES',
+  scale: 30,
+  maxPixels: 1e13,
+})
