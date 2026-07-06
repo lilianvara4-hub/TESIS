@@ -1,0 +1,441 @@
+// =================================================================
+// RUSLE CON LÓGICA CONDICIONAL PARA K (2005- vs 2006+)
+// Adaptado para: Zona de estudio UTM 19S
+// =================================================================
+
+// --- 0. CONFIGURACIÓN INICIAL ---
+
+// TU ÁREA DE ESTUDIO (UTM 19S)
+var aoi = ee.FeatureCollection('projects/ee-lilianvara4/assets/Zona_de_estudio_para_erosion_GEE_19S');
+
+// CONFIGURACIÓN DE FECHA (AJUSTA SEGÚN NECESITES)
+var añoAnalisis = 2005; // <-- CAMBIA AQUÍ: 2005, 2006, 2024, etc.
+
+// CONFIGURACIÓN PARA FACTOR R (20 años previos al análisis)
+var añosRetrocesoR = 20;
+var fechaInicio_R = (añoAnalisis - añosRetrocesoR) + '-01-01'; // Ej: 1985-01-01 para 2005
+var fechaFin_R = (añoAnalisis - 1) + '-12-31'; // Hasta el año anterior
+
+// CONFIGURACIÓN PARA FACTOR C (temporada seca del año de análisis)
+var fechaInicio_C = añoAnalisis + '-05-01';
+var fechaFin_C = añoAnalisis + '-09-30';
+
+// SISTEMA DE COORDENADAS (UTM 19S - igual que tus datos)
+var CRS = 'EPSG:32719';
+var ESCALA = 255; // Resolución de tus datos
+
+// Centramos el mapa
+Map.centerObject(aoi, 10);
+Map.addLayer(aoi, {color: 'black', strokeWidth: 2, fillColor: '00000000'}, 'Área de Estudio ' + añoAnalisis);
+
+// --- 1. FACTOR R (Erosividad de la lluvia) ---
+
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+             .filter(ee.Filter.date(fechaInicio_R, fechaFin_R));
+
+// Calcula Precipitación Media Anual (P)
+var anios = ee.List.sequence(ee.Date(fechaInicio_R).get('year'), ee.Date(fechaFin_R).get('year'));
+var precipAnual = ee.ImageCollection.fromImages(
+  anios.map(function(y) {
+    var annual = chirps.filter(ee.Filter.calendarRange(y, y, 'year')).sum();
+    return annual.set('year', y);
+  })
+);
+var P = precipAnual.mean().rename('P_anual');
+
+// Calcula Precipitación Media Mensual (pi)
+var meses = ee.List.sequence(1, 12);
+var pi_collection = ee.ImageCollection.fromImages(
+  meses.map(function(m) {
+    var totalMonthlyCollection = ee.ImageCollection.fromImages(
+        anios.map(function(y) {
+            var monthlySum = chirps.filter(ee.Filter.calendarRange(y, y, 'year'))
+                                   .filter(ee.Filter.calendarRange(m, m, 'month'))
+                                   .sum();
+            return monthlySum.set('year', y);
+        })
+    );
+    return totalMonthlyCollection.mean().rename('pi').set('month', m);
+  })
+);
+
+// Aplica fórmula de Arnoldus
+var monthly_R_values = pi_collection.map(function(pi_image) {
+  var term_log = pi_image.pow(2).divide(P);
+  var exponent = ee.Image(1.5)
+                   .multiply(term_log.add(1e-9).log10())
+                   .subtract(0.08188);
+  var monthly_R = ee.Image(1.735).multiply(ee.Image(10).pow(exponent));
+  return monthly_R;
+});
+
+var R_Factor = monthly_R_values.sum().rename('R');
+
+// --- 2. FACTOR K (LÓGICA CONDICIONAL: 2005 vs 2006+) ---
+
+// FUNCIÓN PARA CALCULAR K DE SOILGRIDS (como en tu segundo código)
+function calcularK_SoilGrids() {
+  // Extraer las propiedades del suelo de SoilGrids
+  var sand = ee.Image("projects/soilgrids-isric/sand_mean")
+    .select('sand_0-5cm_mean')
+    .divide(10.0);
+    
+  var silt = ee.Image("projects/soilgrids-isric/silt_mean")
+    .select('silt_0-5cm_mean')
+    .divide(10.0);
+    
+  var clay = ee.Image("projects/soilgrids-isric/clay_mean")
+    .select('clay_0-5cm_mean')
+    .divide(10.0);
+    
+  var orgC = ee.Image("projects/soilgrids-isric/soc_mean")
+    .select('soc_0-5cm_mean')
+    .divide(100.0);
+
+  // Cálculos intermedios (fórmula de RUSLE para K)
+  var fcl_si = silt.divide(clay.add(silt)).pow(0.3);
+  
+  var forgc = ee.Image(1).subtract(
+    ee.Image(0.25).multiply(orgC).divide(
+      orgC.add(ee.Image(3.72).subtract(ee.Image(2.95).multiply(orgC)).exp())
+    )
+  );
+  
+  var fcsand = ee.Image(0.2).add(
+    ee.Image(0.3).multiply(
+      ee.Image(-0.0256).multiply(sand).multiply(ee.Image(1).subtract(silt.divide(100))).exp()
+    )
+  );
+  
+  var term_hisand = ee.Image(1).subtract(sand.divide(100));
+  
+  var fhisand = ee.Image(1).subtract(
+    ee.Image(0.7).multiply(term_hisand).divide(
+      term_hisand.add(ee.Image(-5.51).add(ee.Image(22.9).multiply(term_hisand)).exp())
+    )
+  );
+
+  // Factor K final
+  var K_soilgrids = ee.Image(0.1317)
+    .multiply(fcsand)
+    .multiply(fcl_si)
+    .multiply(forgc)
+    .multiply(fhisand)
+    .rename('K_soilgrids');
+    
+  return K_soilgrids;
+}
+
+// DECISIÓN: ¿SoilGrids o K personalizado?
+var K_Factor;
+
+if (añoAnalisis <= 2005) {
+  // Para 2005 o antes: usar SoilGrids (sin minería)
+  print('Usando SoilGrids para K (año ' + añoAnalisis + ' - sin minería)');
+  
+  var K_soilgrids = calcularK_SoilGrids();
+  
+  // Preparar y ajustar K de SoilGrids
+  K_Factor = K_soilgrids
+    .reproject({crs: CRS, scale: ESCALA})
+    .clip(aoi)
+    .updateMask(K_soilgrids.gt(0))
+    .where(K_soilgrids.lt(0.001), 0.001)
+    .where(K_soilgrids.gt(0.15), 0.15)
+    .rename('K');
+    
+} else {
+  // Para 2006 en adelante: usar tu K personalizado (con minería)
+  print('Usando K personalizado para año ' + añoAnalisis + ' (con minería)');
+  
+  var K_raw = ee.Image('projects/ee-lilianvara4/assets/factor_k_sin_cauce_GEE_19S');
+  
+  // Limpieza y preparación de TU K personalizado
+  K_Factor = K_raw
+    .updateMask(K_raw.gt(0))
+    .where(K_raw.lt(0.001), 0.001)
+    .where(K_raw.gt(0.15), 0.15)
+    .reproject({crs: CRS, scale: ESCALA})
+    .clip(aoi)
+    .rename('K');
+}
+
+// =================================================================
+// RUSLE CON LS CORREGIDO PARA 255m
+// =================================================================
+
+// ... (todo igual hasta factor K)
+
+// --- 3. FACTOR LS (CALCULAR EN 30m, LUEGO REDIMENSIONAR) ---
+
+// 3A. Calcular LS en alta resolución (30m)
+function calcularLS_30m() {
+  var dem = ee.Image('USGS/SRTMGL1_003');
+  var merit = ee.Image("MERIT/Hydro/v1_0_1");
+  
+  var slope_rad = ee.Terrain.slope(dem).multiply(Math.PI / 180);
+  var sin_theta = slope_rad.sin();
+  var tan_theta = slope_rad.tan();
+  
+  var flow_dir = merit.select('dir');
+  var upa_unmasked = merit.select('upa').unmask(0);
+  var A_total = upa_unmasked.multiply(1e6);
+  
+  var pixelArea = merit.projection().nominalScale().pow(2);
+  var A_in = A_total.subtract(pixelArea);
+  A_in = A_in.where(A_in.lt(0), 0);
+  
+  var x_ij = ee.Image(1.0)
+    .where(flow_dir.eq(2), 1.414)
+    .where(flow_dir.eq(8), 1.414)
+    .where(flow_dir.eq(32), 1.414)
+    .where(flow_dir.eq(128), 1.414);
+  
+  var beta = sin_theta.divide(sin_theta.pow(0.8).multiply(3.0).add(0.56));
+  var m = beta.divide(beta.add(1));
+  
+  var cellSize = merit.projection().nominalScale();
+  var numerator = A_total.pow(m.add(1)).subtract(A_in.pow(m.add(1)));
+  var term_D = ee.Image(cellSize).pow(m.add(2));
+  var term_x = x_ij.pow(m);
+  var term_2213 = ee.Image(22.13).pow(m);
+  var denominator = term_D.multiply(term_x).multiply(term_2213);
+  var L = numerator.divide(denominator);
+  
+  var S1 = sin_theta.multiply(10.8).add(0.03);
+  var S2 = sin_theta.multiply(16.8).subtract(0.50);
+  var S = ee.Image(0).where(tan_theta.lt(0.09), S1).where(tan_theta.gte(0.09), S2);
+  S = S.where(S.lt(0), 0);
+  
+  return L.multiply(S).rename('LS_30m');
+}
+
+// 3B. Calcular y redimensionar a 255m
+var LS_30m = calcularLS_30m();
+var LS_255m = LS_30m
+  .reduceResolution({
+    reducer: ee.Reducer.mean(),
+    maxPixels: 1024
+  })
+  .reproject({crs: CRS, scale: ESCALA})
+  .clip(aoi)
+  .rename('LS');
+
+var LS_Factor = LS_255m;
+
+
+// --- 4. FACTOR C (Cobertura vegetal) - LANDSAT para año específico ---
+
+// Función CORREGIDA para Landsat histórico
+function getLandsatCollection(year) {
+  if (year >= 2013) {
+    // Landsat 8 (2013-presente)
+    return {
+      collection: 'LANDSAT/LC08/C02/T1_L2',
+      redBand: 'SR_B4',
+      nirBand: 'SR_B5',
+      qaBand: 'QA_PIXEL'
+    };
+  } else if (year >= 2003 && year <= 2012) {
+    // Período SLC-off de Landsat 7 (2003-2012): usar Landsat 5 si disponible
+    return {
+      collection: 'LANDSAT/LT05/C02/T1_L2',
+      redBand: 'SR_B3',
+      nirBand: 'SR_B4',
+      qaBand: 'QA_PIXEL'
+    };
+  } else if (year >= 1999 && year < 2003) {
+    // Landsat 7 antes de la falla SLC
+    return {
+      collection: 'LANDSAT/LE07/C02/T1_L2',
+      redBand: 'SR_B3',
+      nirBand: 'SR_B4',
+      qaBand: 'QA_PIXEL'
+    };
+  } else {
+    // Landsat 5 (1984-1999, y como respaldo para otros años)
+    return {
+      collection: 'LANDSAT/LT05/C02/T1_L2',
+      redBand: 'SR_B3',
+      nirBand: 'SR_B4',
+      qaBand: 'QA_PIXEL'
+    };
+  }
+}
+
+// Función para remover nubes Landsat
+function maskCloudsLandsat(image) {
+  var qa = image.select(landsatConfig.qaBand);
+  var cloudMask = qa.bitwiseAnd(1 << 3)  // nubes densas
+                    .or(qa.bitwiseAnd(1 << 4))  // cirros
+                    .or(qa.bitwiseAnd(1 << 5))  // sombra
+                    .eq(0);
+  return image.updateMask(cloudMask);
+}
+
+// Obtener configuración Landsat según el año
+var landsatConfig = getLandsatCollection(añoAnalisis);
+print('Usando Landsat para año ' + añoAnalisis + ':', landsatConfig.collection);
+
+// Cargar y procesar Landsat
+var coleccion_landsat = ee.ImageCollection(landsatConfig.collection)
+  .filterBounds(aoi)
+  .filterDate(fechaInicio_C, fechaFin_C)
+  .map(maskCloudsLandsat)
+  .select([landsatConfig.redBand, landsatConfig.nirBand]);
+
+// Verificar si hay imágenes disponibles
+var conteoImagenes = coleccion_landsat.size();
+print('Número de imágenes Landsat disponibles:', conteoImagenes);
+
+// Calcular NDVI promedio y Factor C
+var ndviPromedio = coleccion_landsat.map(function(img) {
+    return img.normalizedDifference([landsatConfig.nirBand, landsatConfig.redBand]).rename('NDVI');
+  }).mean()
+  .reproject({crs: CRS, scale: ESCALA});
+
+// Si no hay imágenes, usar NDVI constante o de otro año
+if (conteoImagenes.getInfo() === 0) {
+  print('¡ADVERTENCIA: No hay imágenes Landsat para ' + añoAnalisis + '! Usando NDVI promedio.');
+  // Crear un NDVI constante (ajustar según necesidad)
+  ndviPromedio = ee.Image(0.6).rename('NDVI').reproject({crs: CRS, scale: ESCALA});
+}
+
+var ndvi_corregido = ndviPromedio.where(ndviPromedio.lt(0), 0);
+var C_Factor_calculado = ndvi_corregido.multiply(-2).divide(ndvi_corregido.multiply(-1).add(1)).exp();
+var C_Factor = C_Factor_calculado.where(C_Factor_calculado.gt(1), 1).rename('C');
+
+// --- 5. FACTOR P (Prácticas) - AJUSTADO A 255m ---
+
+var pendiente_grados = ee.Terrain.slope(LS_255m);
+var pendiente_porcentaje = pendiente_grados.multiply(Math.PI/180).tan().multiply(100);
+
+var P_Factor = ee.Image(1.0)
+    .where(pendiente_porcentaje.gt(0).and(pendiente_porcentaje.lte(7.0)), 0.55)
+    .where(pendiente_porcentaje.gt(7.0).and(pendiente_porcentaje.lte(11.3)), 0.60)
+    .where(pendiente_porcentaje.gt(11.3).and(pendiente_porcentaje.lte(17.6)), 0.80)
+    .where(pendiente_porcentaje.gt(17.6).and(pendiente_porcentaje.lte(26.8)), 0.90)
+    .rename('P');
+
+// --- 6. PREPARAR TODOS LOS FACTORES (misma resolución 255m) ---
+
+var R = R_Factor.reproject({crs: CRS, scale: ESCALA}).clip(aoi);
+var K = K_Factor.clip(aoi);
+var LS = LS_Factor.clip(aoi);
+var C = C_Factor.clip(aoi);
+var P = P_Factor.clip(aoi);
+
+// --- 7. CÁLCULO DE RUSLE ---
+
+var perdidaSuelo_A = R.multiply(K).multiply(LS).multiply(C).multiply(P)
+  .rename('Perdida_Suelo_' + añoAnalisis);
+
+// Interpolación para huecos (opcional)
+var relleno_focal = perdidaSuelo_A.focal_mean({
+  radius: 1.5,
+  kernelType: 'circle',
+  units: 'pixels',
+  iterations: 1
+});
+
+var perdidaSuelo_final = perdidaSuelo_A.unmask(relleno_focal)
+  .rename('Perdida_Suelo_' + añoAnalisis + '_Final');
+
+// --- 8. ESTADÍSTICAS ---
+
+print('=== ANÁLISIS RUSLE ' + añoAnalisis + ' ===');
+print('USANDO: ' + (añoAnalisis <= 2005 ? 'SoilGrids (sin minería)' : 'K personalizado (con minería)'));
+
+// Estadísticas por factor
+var factores = {
+  'R': R,
+  'K': K,
+  'LS': LS,
+  'C': C,
+  'P': P
+};
+
+for (var nombre in factores) {
+  factores[nombre].reduceRegion({
+    reducer: ee.Reducer.minMax().combine(ee.Reducer.mean(), null, true),
+    geometry: aoi.geometry(),
+    scale: ESCALA,
+    maxPixels: 1e13
+  }).evaluate(function(stats) {
+    print('Factor ' + nombre + ':', stats);
+  });
+}
+
+// Estadísticas finales
+perdidaSuelo_final.reduceRegion({
+  reducer: ee.Reducer.minMax().combine(ee.Reducer.mean(), null, true),
+  geometry: aoi.geometry(),
+  scale: ESCALA,
+  maxPixels: 1e13
+}).evaluate(function(stats) {
+  print('Pérdida de Suelo ' + añoAnalisis + ' (ton/ha/año):', stats);
+});
+
+// --- 9. VISUALIZACIÓN ---
+
+var rViz = {min: 0, max: 500, palette: ['#ffffcc', '#a1dab4', '#41b6c4', '#2c7fb8', '#253494']};
+var kViz = {min: 0, max: 0.15, palette: ['#1a9641', '#a6d96a', '#ffffbf', '#fdae61', '#d7191c']};
+var lsViz = {min: 0, max: 50, palette: ['#ffffd9', '#edf8b1', '#c7e9b4', '#7fcdbb', '#41b6c4', '#1d91c0', '#225ea8', '#0c2c84']};
+var cViz = {min: 0, max: 1, palette: ['#2ca25f', '#ffffbf', '#fc8d59', '#d73027']};
+var pViz = {min: 0.55, max: 1.0, palette: ['#32cd32', '#ffff00', '#ff7f00', '#ff0000']};
+var perdidaSueloPaleta = ['#2b83ba', '#abdda4', '#ffffbf', '#fdae61', '#d7191c'];
+
+Map.addLayer(R, rViz, 'Factor R ' + añoAnalisis, false);
+Map.addLayer(K, kViz, 'Factor K ' + añoAnalisis, false);
+Map.addLayer(LS, lsViz, 'Factor LS ' + añoAnalisis, false);
+Map.addLayer(C, cViz, 'Factor C ' + añoAnalisis, false);
+Map.addLayer(P, pViz, 'Factor P ' + añoAnalisis, false);
+Map.addLayer(perdidaSuelo_final, {
+  min: 0,
+  max: 100,
+  palette: perdidaSueloPaleta
+}, 'Pérdida Suelo ' + añoAnalisis);
+
+// --- 10. EXPORTACIÓN ---
+
+// Función para exportar
+var exportarFactor = function(imagen, nombre) {
+  Export.image.toDrive({
+    image: imagen,
+    description: 'RUSLE_' + añoAnalisis + '_' + nombre,
+    folder: 'RUSLE_' + añoAnalisis,
+    fileNamePrefix: nombre + '_' + añoAnalisis,
+    region: aoi.geometry(),
+    scale: ESCALA,
+    crs: CRS,
+    maxPixels: 1e13
+  });
+};
+
+// Exportar todos los factores
+exportarFactor(R, 'Factor_R');
+exportarFactor(K, 'Factor_K_' + (añoAnalisis <= 2005 ? 'SoilGrids' : 'Personalizado'));
+exportarFactor(LS, 'Factor_LS');
+exportarFactor(C, 'Factor_C');
+exportarFactor(P, 'Factor_P');
+
+// Exportar resultado final
+Export.image.toDrive({
+  image: perdidaSuelo_final,
+  description: 'RUSLE_Perdida_Suelo_' + añoAnalisis,
+  folder: 'RUSLE_' + añoAnalisis,
+  fileNamePrefix: 'Perdida_Suelo_' + añoAnalisis,
+  region: aoi.geometry(),
+  scale: ESCALA,
+  crs: CRS,
+  maxPixels: 1e13
+});
+
+print('=== EXPORTACIÓN CONFIGURADA ===');
+print('Los archivos se guardarán en la carpeta: RUSLE_' + añoAnalisis);
+print('======================================');
+print('INSTRUCCIONES:');
+print('1. Cambia la variable "añoAnalisis" para analizar diferentes años');
+print('2. Para 2005 o antes: usa SoilGrids (sin minería)');
+print('3. Para 2006 en adelante: usa K personalizado (con minería)');
+print('======================================');
